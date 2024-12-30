@@ -1,0 +1,139 @@
+import os
+from pathlib import Path
+import sys
+node_type = os.getenv('BB_CPU')
+venv_dir = f'/rds/projects/g/gilberts-spatial-biology-image-analysis/Chris/my-virtual-env-icelake'  # edit this line to match the venv directory format
+venv_site_pkgs = Path(venv_dir) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
+if venv_site_pkgs.exists():
+    sys.path.insert(0, str(venv_site_pkgs))
+else:
+    print(f"Path '{venv_site_pkgs}' not found. Check that it exists and/or that it exists for node-type '{node_type}'.")
+
+import squidpy as sq
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scanpy as sc
+import spatialdata as sd
+from spatialdata_io import xenium
+import spatialdata_plot
+import dill
+import anndata as ad
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import MultiPoint
+from shapely.ops import unary_union, triangulate
+import os
+import multiprocessing as mp
+from tqdm import tqdm
+import numpy as np
+from scipy.sparse import csr_matrix
+
+patient1_tx_file_path = sys.argv[1]
+cellgeoms_all_concat_path = sys.argv[2]
+
+# Read input files
+cellgeoms_all_concat = pd.read_csv(cellgeoms_all_concat_path)
+Patient1_tx_file = pd.read_csv(patient1_tx_file_path)
+
+
+Patient1_tx_file['x'] = Patient1_tx_file['x_global_px']
+Patient1_tx_file['y'] = Patient1_tx_file['y_global_px']
+Patient1_tx_file['cell'] = Patient1_tx_file['cell_ID']
+Patient1_tx_file['cell'] = Patient1_tx_file['cell_ID'].astype(str) + '_' + Patient1_tx_file['fov'].astype(str)
+fovs = [Patient1_tx_file[Patient1_tx_file['fov'] == fov] for fov in Patient1_tx_file['fov'].unique()]
+
+def mk_count_mtx(genes, cells, remove_bg=True):
+    # Filter out background cells if required
+    if remove_bg:
+        valid_mask = cells != 0
+        genes = genes[valid_mask]
+        cells = cells[valid_mask]
+
+    # Factorize the genes and cells (faster than Categorical conversion)
+    gene_codes, gene_categories = pd.factorize(genes)
+    cell_codes, cell_categories = pd.factorize(cells)
+
+    # Create the sparse count matrix efficiently
+    counts = csr_matrix(
+        (np.ones_like(gene_codes), (gene_codes, cell_codes)),
+        shape=(len(gene_categories), len(cell_categories))
+    )
+
+    # Convert to a sparse pandas DataFrame and set row and column names
+    counts_df = pd.DataFrame.sparse.from_spmatrix(counts, 
+                                                  index=gene_categories, 
+                                                  columns=cell_categories)
+
+    return counts_df
+
+
+count_matrices = []
+for i in range(len(fovs)):
+    filtered_fov = fovs[i][~fovs[i]['target'].str.contains('SystemControl|Negative')]
+    filtered_fov = filtered_fov[~filtered_fov['cell'].astype(str).str.startswith('0_')]
+    count_matrix = mk_count_mtx(genes=filtered_fov['target'].values, cells=filtered_fov['cell'].values)
+    count_matrices.append(count_matrix)
+
+
+anndata_list = []
+for i, count_matrix in enumerate(count_matrices):
+    adata = ad.AnnData(X=count_matrix.T)
+    adata.obs['sample_name'] = f'FOV_{i+1}'
+    anndata_list.append(adata)
+
+combined_adata = ad.concat(anndata_list, axis=0)
+
+
+
+if 'area' in combined_adata.obs:
+    del combined_adata.obs['area']
+
+if 'spatial' in combined_adata.obsm:
+    del combined_adata.obsm['spatial']
+
+
+combined_FOVs = pd.concat(fovs, ignore_index=True)
+
+centroids_new = combined_FOVs.groupby('cell').agg({'x_global_px': 'mean', 'y_global_px': 'mean'}).reset_index()
+combined_adata.obs['cell_ID'] = combined_adata.obs.index
+centroids_new['cell'] = centroids_new['cell'].astype(str)
+coord_dict = centroids_new.set_index('cell')[['x_global_px', 'y_global_px']].to_dict(orient='index')
+spatial_coordinates = np.full((combined_adata.n_obs, 2), np.nan)
+
+assigned_coords = 0
+for cell, coords in coord_dict.items():
+    if cell in combined_adata.obs.index:
+        spatial_coordinates[combined_adata.obs.index.get_loc(cell)] = [coords['x_global_px'], coords['y_global_px']]
+        assigned_coords += 1
+
+cellgeoms_all_concat['fov'] = cellgeoms_all_concat['cell']
+cellgeoms_all_concat[['fov_part1', 'fov']] = cellgeoms_all_concat['fov'].str.split('_', expand=True)
+cellgeoms_all_concat = cellgeoms_all_concat.drop(columns=['fov_part1'])
+
+combined_adata.obsm['spatial'] = spatial_coordinates
+
+import geopandas as gpd
+from shapely import wkt
+
+cellgeoms_all_concat['geometry'] = cellgeoms_all_concat['geometry'].apply(wkt.loads)
+cellgeoms_all_concat['area'] = cellgeoms_all_concat['geometry'].apply(lambda geom: geom.area)
+area_df = cellgeoms_all_concat[['cell', 'area']]
+area_df.set_index('cell', inplace=True)
+combined_adata.obs = combined_adata.obs.merge(area_df, left_index=True, right_index=True, how='left')
+Q1 = combined_adata.obs['area'].quantile(0.10)
+mask = (combined_adata.obs['area'] >= Q1)
+combined_adata = combined_adata[mask].copy()
+
+
+
+
+if 'area' not in combined_adata.obs and 'spatial' not in combined_adata.obsm:
+    print("Error: Either 'area' in obs or 'spatial' in obsm does not exist in combined_adata.")
+else:
+    print("'area' in obs and 'spatial' in obsm exist. Continuing...")
+    # Continue with further processing
+
+
+
+
+combined_adata.write('combined_adata_unf.h5ad')

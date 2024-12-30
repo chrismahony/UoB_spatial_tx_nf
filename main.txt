@@ -1,0 +1,100 @@
+#!/usr/bin/env nextflow
+
+nextflow.enable.dsl = 2
+
+params.output_dir = "results"
+
+process DRAW_CELLS {
+    beforeScript '''\
+        module purge; module load bluebear
+        module load bear-apps/2022a
+        module load Python/3.10.4-GCCcore-11.3.0-bare
+     '''.stripIndent() 
+
+   
+    publishDir "${params.output_dir}/draw_cells", mode: 'copy'
+
+
+    time '10h'
+    cpus 40	
+    memory { 100.GB * task.attempt }
+
+    input:
+    path patient1_tx_file     
+
+    output:
+    path 'cellgeoms_all_concat.csv'
+
+    script:
+    """
+    python ${projectDir}/modules/draw_1.txt ${patient1_tx_file}
+    """
+}
+
+process PROCESS_ANNDATA {
+    beforeScript '''\
+        module purge; module load bluebear
+        module load bear-apps/2022a
+        module load Python/3.10.4-GCCcore-11.3.0-bare
+     '''.stripIndent() 
+
+    time '10h'
+    cpus 40	
+    memory { 100.GB * task.attempt }
+
+    publishDir "${params.output_dir}/process_anndata", mode: 'copy'
+
+    input:
+    path patient1_tx_file
+    path cellgeoms_all_concat
+
+    output:
+    path 'combined_adata_unf.h5ad', emit: combined_adata
+    
+
+    script:
+    """
+    python ${projectDir}/modules/anndata_2.txt ${patient1_tx_file} ${cellgeoms_all_concat}
+    """
+}
+
+
+process SPATIAL_1 {
+    beforeScript '''\
+        module purge; module load bluebear
+        module load bear-apps/2022a
+        module load Python/3.10.4-GCCcore-11.3.0-bare
+     '''.stripIndent() 
+
+    time '10h'
+    cpus 40	
+    memory { 100.GB * task.attempt }
+
+    publishDir "${params.output_dir}/spatial_1", mode: 'copy'
+
+    input:
+    path combined_adata
+    
+
+    output:
+    path 'combined_adata.h5ad', emit: combined_adata
+    path 'FOV_spatial_plot.tiff'
+    path 'umap_samples.tiff'
+
+    script:
+    """
+    python ${projectDir}/modules/process_anndata_3.txt ${combined_adata} 
+
+    """
+}
+
+
+
+
+workflow {
+   patient1_tx_file = file(params.patient1_tx_file)
+    first_output = DRAW_CELLS(patient1_tx_file)
+    third_output=PROCESS_ANNDATA(patient1_tx_file, first_output)
+    forth_output=SPATIAL_1(third_output)
+        
+}

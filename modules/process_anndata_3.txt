@@ -1,0 +1,183 @@
+import os
+from pathlib import Path
+import sys
+node_type = os.getenv('BB_CPU')
+venv_dir = f'/rds/projects/g/gilberts-spatial-biology-image-analysis/Chris/my-virtual-env-icelake'  # edit this line to match the venv directory format
+venv_site_pkgs = Path(venv_dir) / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
+if venv_site_pkgs.exists():
+    sys.path.insert(0, str(venv_site_pkgs))
+else:
+    print(f"Path '{venv_site_pkgs}' not found. Check that it exists and/or that it exists for node-type '{node_type}'.")
+
+import squidpy as sq
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scanpy as sc
+import spatialdata as sd
+from spatialdata_io import xenium
+import spatialdata_plot
+import dill
+import anndata as ad
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import MultiPoint
+from shapely.ops import unary_union, triangulate
+import os
+import multiprocessing as mp
+from tqdm import tqdm
+import numpy as np
+from scipy.sparse import csr_matrix
+
+
+
+
+combined_adata_path = sys.argv[1]
+
+combined_adata = sc.read(combined_adata_path)
+
+combined_adata.obs['total_counts'] = combined_adata.X.sum(axis=1)
+combined_adata.obs['n_genes_by_counts'] = (combined_adata.X > 0).sum(axis=1)
+
+# Calculate the number of genes per cell (non-zero values per cell)
+genes_per_cell = (combined_adata.X > 0).sum(axis=1)
+
+# Calculate the total counts per cell (sum of all counts per cell)
+counts_per_cell = combined_adata.X.sum(axis=1)
+
+fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+# Plot histogram of number of genes per cell
+axs[0].hist(genes_per_cell, bins=50, color='skyblue', edgecolor='black')
+axs[0].set_title('Number of Genes per Cell')
+axs[0].set_xlabel('Number of Genes')
+axs[0].set_ylabel('Number of Cells')
+
+# Plot histogram of counts per cell
+axs[1].hist(counts_per_cell, bins=50, color='lightgreen', edgecolor='black')
+axs[1].set_title('Number of Counts per Cell')
+axs[1].set_xlabel('Number of Counts')
+axs[1].set_ylabel('Number of Cells')
+
+plt.tight_layout()
+plt.savefig('cells_QC.tiff', format='tiff', dpi=300) 
+
+sc.pp.filter_cells(combined_adata, min_genes=75)
+sc.pp.filter_genes(combined_adata, min_cells=5)
+sc.pp.normalize_total(combined_adata, inplace=True)
+sc.pp.log1p(combined_adata)
+sc.pp.pca(combined_adata)
+sc.pp.neighbors(combined_adata)
+sc.external.pp.bbknn(combined_adata, batch_key="sample_name")
+sc.tl.umap(combined_adata)
+
+########################## PLOT UMAP#################################
+
+from matplotlib import pyplot as plt
+
+with plt.rc_context():  
+    sc.pl.umap(combined_adata, color=["sample_name"], show=False)
+    plt.savefig("umap_samples.tiff", bbox_inches="tight")
+
+########################## PLOT SPATIAL FOVS#################################
+
+
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+import numpy as np
+
+# Extract spatial coordinates
+coords = combined_adata.obsm["spatial"]
+
+# Extract sample names
+sample_names = combined_adata.obs["sample_name"]
+
+# Generate 10 distinct colors and repeat them over the samples
+base_colors = plt.cm.get_cmap('tab10', 10)  # Use 'tab10' which has 10 distinct colors
+num_samples = len(sample_names.unique())
+
+# Create a repeated colormap by cycling the 10 base colors over all samples
+repeated_colors = [base_colors(i % 10) for i in range(num_samples)]
+custom_cmap = ListedColormap(repeated_colors)
+
+# Create a scatter plot, coloring by sample names
+plt.figure(figsize=(10, 10))
+scatter = plt.scatter(
+    coords[:, 0], coords[:, 1], 
+    c=sample_names.astype('category').cat.codes, 
+    cmap=custom_cmap, 
+    s=1
+)
+
+# Label the axes
+plt.xlabel("X Coordinate")
+plt.ylabel("Y Coordinate")
+
+# Show the plot
+plt.savefig("FOV_spatial_plot.tiff", format='tiff', dpi=300)
+
+
+###################### FIND VARIBLE GENES AND PLOT ######################
+
+# Find spatially varibly genes
+sq.gr.spatial_neighbors(combined_adata, coord_type="generic", delaunay=True)
+sq.gr.spatial_autocorr(
+    combined_adata,
+    mode="moran",
+    n_perms=100,
+    n_jobs=1,
+)
+
+
+moran_res = combined_adata.uns["moranI"]
+top_genes = moran_res["I"].nlargest(3).index 
+
+for gene in top_genes:
+    # Create the figure explicitly
+    plt.figure(figsize=(12, 16))
+
+    # Plot each gene using spatial_scatter
+    sq.pl.spatial_scatter(
+        combined_adata,
+        library_id="spatial",
+        color=[gene],  # Plot each gene
+        shape=None,
+        size=2,
+        img=False,
+    )
+
+    # Get the current figure and invert the y-axis for all axes
+    fig = plt.gcf()
+    axes = fig.get_axes()
+    
+    # Flip vertically by inverting the y-axis
+    for ax in axes:
+        ax.invert_yaxis()  # Flip vertically
+    
+    # Save the figure using the parameter-style placeholder
+    plt.savefig(f"{gene}_spatial_plot.tiff", format='tiff', dpi=300)
+
+
+################CLUSTERING###########
+
+
+resolution = 0.1
+max_resolution = 2.0
+while resolution <= max_resolution:
+    sc.tl.louvain(combined_adata, resolution=resolution, key_added=f'louvain_{resolution:.1f}')
+    num_clusters = combined_adata.obs[f'louvain_{resolution:.1f}'].nunique()
+    print(f"Resolution: {resolution:.1f}, Number of clusters: {num_clusters}")
+    
+    if num_clusters >= 8:
+        print(f"Running sc.tl.rank_genes_groups for resolution {resolution:.1f}")
+        sc.tl.rank_genes_groups(combined_adata, groupby=f'louvain_{resolution:.1f}', method='t-test')
+        break
+    
+    
+    resolution += 0.1
+
+
+if resolution > max_resolution:
+    print("Did not find exactly 8 clusters within the given resolution range.")
+
+
+combined_adata.write('combined_adata.h5ad')
