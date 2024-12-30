@@ -13,4 +13,4 @@ module purge; module load bluebear
 module load bear-apps/2022b
 module load Nextflow/24.04.2
 
-nextflow run main.txt --patient1_tx_file /rds/projects/g/gilberts-spatial-biology-image-analysis/CosMx/Liver/Patient1/Patient1_tx_file.csv -resume
+nextflow run main.txt --patient1_tx_file /rds/projects/path/tx_file.csv -resume
